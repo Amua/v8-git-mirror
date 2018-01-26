@@ -146,16 +146,6 @@ l.setUTCMilliseconds();
 l.setUTCMilliseconds(2);
 assertTrue(isNaN(l.getUTCMilliseconds()));
 
-// Test that toLocaleTimeString only returns the time portion of the
-// date without the timezone information.
-function testToLocaleTimeString() {
-  var d = new Date();
-  var s = d.toLocaleTimeString("en-GB");
-  assertEquals(8, s.length);
-}
-
-testToLocaleTimeString();
-
 // Test that -0 is treated correctly in MakeDay.
 var d = new Date();
 assertDoesNotThrow("d.setDate(-0)");
@@ -203,7 +193,9 @@ assertEquals(-8640000000000000, Date.UTC(1970, 0, 1 - 100000001, 24));
 
 
 // Parsing ES5 ISO-8601 dates.
-// When TZ is omitted, it defaults to the local timezone
+// When TZ is omitted, it defaults to the local timezone if there is
+// no time, and to UTC if a time is provided. This file tests the
+// "timezone present" case; timezone absent is tested by test/mjsunit/date-parse.js
 
 // Check epoch.
 assertEquals(0, Date.parse("1970-01-01T00:00:00.000+00:00"));
@@ -322,24 +314,26 @@ for (var i = 0; i < 24; i++) {
   }
 }
 
+// Test padding with 0 rather than spaces
+assertEquals('Wed, 01 Jan 0020 00:00:00 GMT', new Date('0020-01-01T00:00:00Z').toUTCString());
+let dateRegExp = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{2} [0-9]{4}$/
+match = dateRegExp.exec(new Date('0020-01-01T00:00:00Z').toDateString());
+assertNotNull(match);
+let stringRegExp = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT[+-][0-9]{4}( \(.+\))?$/
+match = stringRegExp.exec(new Date('0020-01-01T00:00:00Z').toString());
+assertNotNull(match);
+
 assertThrows('Date.prototype.setTime.call("", 1);', TypeError);
 assertThrows('Date.prototype.setYear.call("", 1);', TypeError);
 assertThrows('Date.prototype.setHours.call("", 1, 2, 3, 4);', TypeError);
 assertThrows('Date.prototype.getDate.call("");', TypeError);
 assertThrows('Date.prototype.getUTCDate.call("");', TypeError);
 
-var date = new Date();
-date.getTime();
-date.getTime();
-%OptimizeFunctionOnNextCall(Date.prototype.getTime);
-assertThrows(function() { Date.prototype.getTime.call(""); }, TypeError);
-assertUnoptimized(Date.prototype.getTime);
+assertThrows(function() { Date.prototype.getTime.call(0) }, TypeError);
+assertThrows(function() { Date.prototype.getTime.call("") }, TypeError);
 
-date.getYear();
-date.getYear();
-%OptimizeFunctionOnNextCall(Date.prototype.getYear);
-assertThrows(function() { Date.prototype.getYear.call(""); }, TypeError);
-assertUnoptimized(Date.prototype.getYear);
+assertThrows(function() { Date.prototype.getYear.call(0) }, TypeError);
+assertThrows(function() { Date.prototype.getYear.call("") }, TypeError);
 
 (function TestDatePrototypeOrdinaryObject() {
   assertEquals(Object.prototype, Date.prototype.__proto__);
@@ -353,7 +347,7 @@ delete Date.prototype.getUTCHours;
 delete Date.prototype.getUTCMinutes;
 delete Date.prototype.getUTCSeconds;
 delete Date.prototype.getUTCMilliseconds;
-date.toISOString();
+(new Date()).toISOString();
 
 (function TestDeleteToString() {
   assertTrue(delete Date.prototype.toString);

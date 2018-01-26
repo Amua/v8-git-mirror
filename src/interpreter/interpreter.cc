@@ -4,252 +4,311 @@
 
 #include "src/interpreter/interpreter.h"
 
+#include <fstream>
+#include <memory>
+
+#include "src/ast/prettyprinter.h"
+#include "src/bootstrapper.h"
+#include "src/codegen.h"
+#include "src/compilation-info.h"
 #include "src/compiler.h"
-#include "src/compiler/interpreter-assembler.h"
-#include "src/factory.h"
+#include "src/counters-inl.h"
 #include "src/interpreter/bytecode-generator.h"
 #include "src/interpreter/bytecodes.h"
-#include "src/zone.h"
+#include "src/log.h"
+#include "src/objects-inl.h"
+#include "src/objects/shared-function-info.h"
+#include "src/parsing/parse-info.h"
+#include "src/setup-isolate.h"
+#include "src/visitors.h"
 
 namespace v8 {
 namespace internal {
 namespace interpreter {
 
-using compiler::Node;
-#define __ assembler->
+class InterpreterCompilationJob final : public CompilationJob {
+ public:
+  InterpreterCompilationJob(ParseInfo* parse_info, FunctionLiteral* literal,
+                            Isolate* isolate);
 
+ protected:
+  Status PrepareJobImpl() final;
+  Status ExecuteJobImpl() final;
+  Status FinalizeJobImpl() final;
 
-Interpreter::Interpreter(Isolate* isolate)
-    : isolate_(isolate) {}
+ private:
+  class TimerScope final {
+   public:
+    explicit TimerScope(RuntimeCallCounter* counter)
+        : runtime_stats_enabled_(FLAG_runtime_stats) {
+      if (V8_UNLIKELY(runtime_stats_enabled_ && counter != nullptr)) {
+        timer_.Start(counter, nullptr);
+      }
+    }
 
+    ~TimerScope() {
+      if (V8_UNLIKELY(runtime_stats_enabled_)) {
+        timer_.Stop();
+      }
+    }
+
+   private:
+    RuntimeCallTimer timer_;
+    bool runtime_stats_enabled_;
+
+    DISALLOW_COPY_AND_ASSIGN(TimerScope);
+  };
+
+  BytecodeGenerator* generator() { return &generator_; }
+
+  Zone zone_;
+  CompilationInfo compilation_info_;
+  BytecodeGenerator generator_;
+  RuntimeCallStats* runtime_call_stats_;
+  RuntimeCallCounter background_execute_counter_;
+
+  DISALLOW_COPY_AND_ASSIGN(InterpreterCompilationJob);
+};
+
+Interpreter::Interpreter(Isolate* isolate) : isolate_(isolate) {
+  memset(dispatch_table_, 0, sizeof(dispatch_table_));
+
+  if (FLAG_trace_ignition_dispatches) {
+    static const int kBytecodeCount = static_cast<int>(Bytecode::kLast) + 1;
+    bytecode_dispatch_counters_table_.reset(
+        new uintptr_t[kBytecodeCount * kBytecodeCount]);
+    memset(bytecode_dispatch_counters_table_.get(), 0,
+           sizeof(uintptr_t) * kBytecodeCount * kBytecodeCount);
+  }
+}
+
+Code* Interpreter::GetBytecodeHandler(Bytecode bytecode,
+                                      OperandScale operand_scale) {
+  DCHECK(IsDispatchTableInitialized());
+  DCHECK(Bytecodes::BytecodeHasHandler(bytecode, operand_scale));
+  size_t index = GetDispatchTableIndex(bytecode, operand_scale);
+  Address code_entry = dispatch_table_[index];
+  return Code::GetCodeFromTargetAddress(code_entry);
+}
 
 // static
-Handle<FixedArray> Interpreter::CreateUninitializedInterpreterTable(
-    Isolate* isolate) {
-  Handle<FixedArray> handler_table = isolate->factory()->NewFixedArray(
-      static_cast<int>(Bytecode::kLast) + 1, TENURED);
-  // We rely on the interpreter handler table being immovable, so check that
-  // it was allocated on the first page (which is always immovable).
-  DCHECK(isolate->heap()->old_space()->FirstPage()->Contains(
-      handler_table->address()));
-  return handler_table;
+size_t Interpreter::GetDispatchTableIndex(Bytecode bytecode,
+                                          OperandScale operand_scale) {
+  static const size_t kEntriesPerOperandScale = 1u << kBitsPerByte;
+  size_t index = static_cast<size_t>(bytecode);
+  switch (operand_scale) {
+    case OperandScale::kSingle:
+      return index;
+    case OperandScale::kDouble:
+      return index + kEntriesPerOperandScale;
+    case OperandScale::kQuadruple:
+      return index + 2 * kEntriesPerOperandScale;
+  }
+  UNREACHABLE();
 }
 
-
-void Interpreter::Initialize() {
-  DCHECK(FLAG_ignition);
-  Handle<FixedArray> handler_table = isolate_->factory()->interpreter_table();
-  if (!IsInterpreterTableInitialized(handler_table)) {
-    Zone zone;
-    HandleScope scope(isolate_);
-
-#define GENERATE_CODE(Name, ...)                                      \
-    {                                                                 \
-      compiler::InterpreterAssembler assembler(isolate_, &zone,       \
-                                               Bytecode::k##Name);    \
-      Do##Name(&assembler);                                           \
-      Handle<Code> code = assembler.GenerateCode();                   \
-      handler_table->set(static_cast<int>(Bytecode::k##Name), *code); \
+void Interpreter::IterateDispatchTable(RootVisitor* v) {
+  for (int i = 0; i < kDispatchTableSize; i++) {
+    Address code_entry = dispatch_table_[i];
+    Object* code = code_entry == nullptr
+                       ? nullptr
+                       : Code::GetCodeFromTargetAddress(code_entry);
+    Object* old_code = code;
+    v->VisitRootPointer(Root::kDispatchTable, &code);
+    if (code != old_code) {
+      dispatch_table_[i] = reinterpret_cast<Code*>(code)->entry();
     }
-    BYTECODE_LIST(GENERATE_CODE)
-#undef GENERATE_CODE
   }
 }
 
+namespace {
 
-bool Interpreter::MakeBytecode(CompilationInfo* info) {
-  Handle<SharedFunctionInfo> shared_info = info->shared_info();
+void MaybePrintAst(ParseInfo* parse_info, CompilationInfo* compilation_info) {
+  Isolate* isolate = compilation_info->isolate();
+  bool print_ast = isolate->bootstrapper()->IsActive() ? FLAG_print_builtin_ast
+                                                       : FLAG_print_ast;
+  if (!print_ast) return;
 
-  BytecodeGenerator generator(info->isolate(), info->zone());
-  Handle<BytecodeArray> bytecodes = generator.MakeBytecode(info);
-  if (FLAG_print_bytecode) {
-    bytecodes->Print();
+  // Requires internalizing the AST, so make sure we are on the main thread and
+  // allow handle dereference and allocations.
+  // TODO(rmcilroy): Make ast-printer print ast raw strings instead of
+  // internalized strings to avoid internalizing here.
+  DCHECK(ThreadId::Current().Equals(isolate->thread_id()));
+  AllowHandleDereference allow_deref;
+  AllowHandleAllocation allow_handles;
+  AllowHeapAllocation allow_gc;
+  parse_info->ast_value_factory()->Internalize(isolate);
+
+  OFStream os(stdout);
+  std::unique_ptr<char[]> name = compilation_info->GetDebugName();
+  os << "[generating bytecode for function: "
+     << compilation_info->GetDebugName().get() << "]" << std::endl;
+#ifdef DEBUG
+  os << "--- AST ---" << std::endl
+     << AstPrinter(isolate).PrintProgram(parse_info->literal()) << std::endl;
+#endif  // DEBUG
+}
+
+bool ShouldPrintBytecode(Handle<SharedFunctionInfo> shared) {
+  if (!FLAG_print_bytecode) return false;
+
+  // Checks whether function passed the filter.
+  if (shared->is_toplevel()) {
+    Vector<const char> filter = CStrVector(FLAG_print_bytecode_filter);
+    return (filter.length() == 0) || (filter.length() == 1 && filter[0] == '*');
+  } else {
+    return shared->PassesFilter(FLAG_print_bytecode_filter);
+  }
+}
+
+}  // namespace
+
+InterpreterCompilationJob::InterpreterCompilationJob(ParseInfo* parse_info,
+                                                     FunctionLiteral* literal,
+                                                     Isolate* isolate)
+    : CompilationJob(isolate, parse_info, &compilation_info_, "Ignition"),
+      zone_(isolate->allocator(), ZONE_NAME),
+      compilation_info_(&zone_, isolate, parse_info, literal),
+      generator_(&compilation_info_),
+      runtime_call_stats_(isolate->counters()->runtime_call_stats()),
+      background_execute_counter_("CompileBackgroundIgnition") {}
+
+InterpreterCompilationJob::Status InterpreterCompilationJob::PrepareJobImpl() {
+  MaybePrintAst(parse_info(), compilation_info());
+  return SUCCEEDED;
+}
+
+InterpreterCompilationJob::Status InterpreterCompilationJob::ExecuteJobImpl() {
+  TimerScope runtimeTimer(
+      executed_on_background_thread() ? &background_execute_counter_ : nullptr);
+  RuntimeCallTimerScope runtimeTimerScope(
+      !executed_on_background_thread() ? runtime_call_stats_ : nullptr,
+      &RuntimeCallStats::CompileIgnition);
+
+  // TODO(lpy): add support for background compilation RCS trace.
+  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"), "V8.CompileIgnition");
+
+  generator()->GenerateBytecode(stack_limit());
+
+  if (generator()->HasStackOverflow()) {
+    return FAILED;
+  }
+  return SUCCEEDED;
+}
+
+InterpreterCompilationJob::Status InterpreterCompilationJob::FinalizeJobImpl() {
+  // Add background runtime call stats.
+  if (V8_UNLIKELY(FLAG_runtime_stats && executed_on_background_thread())) {
+    runtime_call_stats_->CompileBackgroundIgnition.Add(
+        &background_execute_counter_);
   }
 
-  DCHECK(shared_info->function_data()->IsUndefined());
-  if (!shared_info->function_data()->IsUndefined()) {
-    return false;
+  RuntimeCallTimerScope runtimeTimerScope(
+      !executed_on_background_thread() ? runtime_call_stats_ : nullptr,
+      &RuntimeCallStats::CompileIgnitionFinalization);
+
+  Handle<BytecodeArray> bytecodes =
+      generator()->FinalizeBytecode(isolate(), parse_info()->script());
+  if (generator()->HasStackOverflow()) {
+    return FAILED;
   }
 
-  shared_info->set_function_data(*bytecodes);
-  info->SetCode(info->isolate()->builtins()->InterpreterEntryTrampoline());
-  info->EnsureFeedbackVector();
-  return true;
+  if (ShouldPrintBytecode(compilation_info()->shared_info())) {
+    OFStream os(stdout);
+    std::unique_ptr<char[]> name = compilation_info()->GetDebugName();
+    os << "[generated bytecode for function: "
+       << compilation_info()->GetDebugName().get() << "]" << std::endl;
+    bytecodes->Disassemble(os);
+    os << std::flush;
+  }
+
+  compilation_info()->SetBytecodeArray(bytecodes);
+  compilation_info()->SetCode(
+      BUILTIN_CODE(compilation_info()->isolate(), InterpreterEntryTrampoline));
+  return SUCCEEDED;
 }
 
-
-bool Interpreter::IsInterpreterTableInitialized(
-    Handle<FixedArray> handler_table) {
-  DCHECK(handler_table->length() == static_cast<int>(Bytecode::kLast) + 1);
-  return handler_table->get(0) != isolate_->heap()->undefined_value();
+CompilationJob* Interpreter::NewCompilationJob(ParseInfo* parse_info,
+                                               FunctionLiteral* literal,
+                                               Isolate* isolate) {
+  return new InterpreterCompilationJob(parse_info, literal, isolate);
 }
 
-
-// LdaZero
-//
-// Load literal '0' into the accumulator.
-void Interpreter::DoLdaZero(compiler::InterpreterAssembler* assembler) {
-  Node* zero_value = __ NumberConstant(0.0);
-  __ SetAccumulator(zero_value);
-  __ Dispatch();
+bool Interpreter::IsDispatchTableInitialized() {
+  return dispatch_table_[0] != nullptr;
 }
 
-
-// LdaSmi8 <imm8>
-//
-// Load an 8-bit integer literal into the accumulator as a Smi.
-void Interpreter::DoLdaSmi8(compiler::InterpreterAssembler* assembler) {
-  Node* raw_int = __ BytecodeOperandImm8(0);
-  Node* smi_int = __ SmiTag(raw_int);
-  __ SetAccumulator(smi_int);
-  __ Dispatch();
+const char* Interpreter::LookupNameOfBytecodeHandler(Code* code) {
+#ifdef ENABLE_DISASSEMBLER
+#define RETURN_NAME(Name, ...)                                 \
+  if (dispatch_table_[Bytecodes::ToByte(Bytecode::k##Name)] == \
+      code->entry()) {                                         \
+    return #Name;                                              \
+  }
+  BYTECODE_LIST(RETURN_NAME)
+#undef RETURN_NAME
+#endif  // ENABLE_DISASSEMBLER
+  return nullptr;
 }
 
-
-// LdaConstant <idx>
-//
-// Load constant literal at |idx| in the constant pool into the accumulator.
-void Interpreter::DoLdaConstant(compiler::InterpreterAssembler* assembler) {
-  Node* index = __ BytecodeOperandIdx(0);
-  Node* constant = __ LoadConstantPoolEntry(index);
-  __ SetAccumulator(constant);
-  __ Dispatch();
+uintptr_t Interpreter::GetDispatchCounter(Bytecode from, Bytecode to) const {
+  int from_index = Bytecodes::ToByte(from);
+  int to_index = Bytecodes::ToByte(to);
+  return bytecode_dispatch_counters_table_[from_index * kNumberOfBytecodes +
+                                           to_index];
 }
 
+Local<v8::Object> Interpreter::GetDispatchCountersObject() {
+  v8::Isolate* isolate = reinterpret_cast<v8::Isolate*>(isolate_);
+  Local<v8::Context> context = isolate->GetCurrentContext();
 
-// LdaUndefined
-//
-// Load Undefined into the accumulator.
-void Interpreter::DoLdaUndefined(compiler::InterpreterAssembler* assembler) {
-  Node* undefined_value =
-      __ HeapConstant(isolate_->factory()->undefined_value());
-  __ SetAccumulator(undefined_value);
-  __ Dispatch();
+  Local<v8::Object> counters_map = v8::Object::New(isolate);
+
+  // Output is a JSON-encoded object of objects.
+  //
+  // The keys on the top level object are source bytecodes,
+  // and corresponding value are objects. Keys on these last are the
+  // destinations of the dispatch and the value associated is a counter for
+  // the correspondent source-destination dispatch chain.
+  //
+  // Only non-zero counters are written to file, but an entry in the top-level
+  // object is always present, even if the value is empty because all counters
+  // for that source are zero.
+
+  for (int from_index = 0; from_index < kNumberOfBytecodes; ++from_index) {
+    Bytecode from_bytecode = Bytecodes::FromByte(from_index);
+    Local<v8::Object> counters_row = v8::Object::New(isolate);
+
+    for (int to_index = 0; to_index < kNumberOfBytecodes; ++to_index) {
+      Bytecode to_bytecode = Bytecodes::FromByte(to_index);
+      uintptr_t counter = GetDispatchCounter(from_bytecode, to_bytecode);
+
+      if (counter > 0) {
+        std::string to_name = Bytecodes::ToString(to_bytecode);
+        Local<v8::String> to_name_object =
+            v8::String::NewFromUtf8(isolate, to_name.c_str(),
+                                    NewStringType::kNormal)
+                .ToLocalChecked();
+        Local<v8::Number> counter_object = v8::Number::New(isolate, counter);
+        CHECK(counters_row
+                  ->DefineOwnProperty(context, to_name_object, counter_object)
+                  .IsJust());
+      }
+    }
+
+    std::string from_name = Bytecodes::ToString(from_bytecode);
+    Local<v8::String> from_name_object =
+        v8::String::NewFromUtf8(isolate, from_name.c_str(),
+                                NewStringType::kNormal)
+            .ToLocalChecked();
+
+    CHECK(
+        counters_map->DefineOwnProperty(context, from_name_object, counters_row)
+            .IsJust());
+  }
+
+  return counters_map;
 }
-
-
-// LdaNull
-//
-// Load Null into the accumulator.
-void Interpreter::DoLdaNull(compiler::InterpreterAssembler* assembler) {
-  Node* null_value = __ HeapConstant(isolate_->factory()->null_value());
-  __ SetAccumulator(null_value);
-  __ Dispatch();
-}
-
-
-// LdaTheHole
-//
-// Load TheHole into the accumulator.
-void Interpreter::DoLdaTheHole(compiler::InterpreterAssembler* assembler) {
-  Node* the_hole_value = __ HeapConstant(isolate_->factory()->the_hole_value());
-  __ SetAccumulator(the_hole_value);
-  __ Dispatch();
-}
-
-
-// LdaTrue
-//
-// Load True into the accumulator.
-void Interpreter::DoLdaTrue(compiler::InterpreterAssembler* assembler) {
-  Node* true_value = __ HeapConstant(isolate_->factory()->true_value());
-  __ SetAccumulator(true_value);
-  __ Dispatch();
-}
-
-
-// LdaFalse
-//
-// Load False into the accumulator.
-void Interpreter::DoLdaFalse(compiler::InterpreterAssembler* assembler) {
-  Node* false_value = __ HeapConstant(isolate_->factory()->false_value());
-  __ SetAccumulator(false_value);
-  __ Dispatch();
-}
-
-
-// Ldar <src>
-//
-// Load accumulator with value from register <src>.
-void Interpreter::DoLdar(compiler::InterpreterAssembler* assembler) {
-  Node* reg_index = __ BytecodeOperandReg(0);
-  Node* value = __ LoadRegister(reg_index);
-  __ SetAccumulator(value);
-  __ Dispatch();
-}
-
-
-// Star <dst>
-//
-// Store accumulator to register <dst>.
-void Interpreter::DoStar(compiler::InterpreterAssembler* assembler) {
-  Node* reg_index = __ BytecodeOperandReg(0);
-  Node* accumulator = __ GetAccumulator();
-  __ StoreRegister(accumulator, reg_index);
-  __ Dispatch();
-}
-
-
-void Interpreter::DoBinaryOp(int builtin_context_index,
-                             compiler::InterpreterAssembler* assembler) {
-  // TODO(rmcilroy): Call ICs which back-patch bytecode with type specialized
-  // operations, instead of calling builtins directly.
-  Node* reg_index = __ BytecodeOperandReg(0);
-  Node* lhs = __ LoadRegister(reg_index);
-  Node* rhs = __ GetAccumulator();
-  Node* result = __ CallJSBuiltin(builtin_context_index, lhs, rhs);
-  __ SetAccumulator(result);
-  __ Dispatch();
-}
-
-
-// Add <src>
-//
-// Add register <src> to accumulator.
-void Interpreter::DoAdd(compiler::InterpreterAssembler* assembler) {
-  DoBinaryOp(Context::ADD_BUILTIN_INDEX, assembler);
-}
-
-
-// Sub <src>
-//
-// Subtract register <src> from accumulator.
-void Interpreter::DoSub(compiler::InterpreterAssembler* assembler) {
-  DoBinaryOp(Context::SUB_BUILTIN_INDEX, assembler);
-}
-
-
-// Mul <src>
-//
-// Multiply accumulator by register <src>.
-void Interpreter::DoMul(compiler::InterpreterAssembler* assembler) {
-  DoBinaryOp(Context::MUL_BUILTIN_INDEX, assembler);
-}
-
-
-// Div <src>
-//
-// Divide register <src> by accumulator.
-void Interpreter::DoDiv(compiler::InterpreterAssembler* assembler) {
-  DoBinaryOp(Context::DIV_BUILTIN_INDEX, assembler);
-}
-
-
-// Mod <src>
-//
-// Modulo register <src> by accumulator.
-void Interpreter::DoMod(compiler::InterpreterAssembler* assembler) {
-  DoBinaryOp(Context::MOD_BUILTIN_INDEX, assembler);
-}
-
-
-// Return
-//
-// Return the value in register 0.
-void Interpreter::DoReturn(compiler::InterpreterAssembler* assembler) {
-  __ Return();
-}
-
 
 }  // namespace interpreter
 }  // namespace internal

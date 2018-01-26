@@ -10,12 +10,18 @@ from mock import DEFAULT
 from mock import MagicMock
 import os
 from os import path, sys
+import platform
 import shutil
+import subprocess
 import tempfile
 import unittest
 
 # Requires python-coverage and python-mock. Native python coverage
 # version >= 3.7.1 should be installed to get the best speed.
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUN_PERF = os.path.join(BASE_DIR, 'run_perf.py')
+TEST_DATA = os.path.join(BASE_DIR, 'unittests', 'testdata')
 
 TEST_WORKSPACE = path.join(tempfile.gettempdir(), "test-v8-run-perf")
 
@@ -128,6 +134,9 @@ class PerfTest(unittest.TestCase):
     def chdir(*args, **kwargs):
       self.assertEquals(dirs.pop(), args[0])
     os.chdir = MagicMock(side_effect=chdir)
+
+    subprocess.check_call = MagicMock()
+    platform.system = MagicMock(return_value='Linux')
 
   def _CallMain(self, *args):
     self._test_output = path.join(TEST_WORKSPACE, "results.json")
@@ -290,12 +299,12 @@ class PerfTest(unittest.TestCase):
       {"name": "DeltaBlue", "results": ["5.0", "6.0"], "stddev": "0.8"},
     ])
     self._VerifyErrors(
-        ["Test Richards should only run once since a stddev is provided "
+        ["Test test/Richards should only run once since a stddev is provided "
          "by the test.",
-         "Test DeltaBlue should only run once since a stddev is provided "
+         "Test test/DeltaBlue should only run once since a stddev is provided "
          "by the test.",
          "Regexp \"^DeltaBlue\-stddev: (.+)$\" didn't match for test "
-         "DeltaBlue."])
+         "test/DeltaBlue."])
     self._VerifyMock(path.join("out", "x64.release", "d7"), "--flag", "run.js")
 
   def testBuildbot(self):
@@ -335,7 +344,7 @@ class PerfTest(unittest.TestCase):
     ])
     self._VerifyErrors(
         ["Regexp \"^Richards: (.+)$\" "
-         "returned a non-numeric for test Richards.",
+         "returned a non-numeric for test test/Richards.",
          "Not all traces have the same number of results."])
     self._VerifyMock(path.join("out", "Release", "d7"), "--flag", "run.js")
 
@@ -348,7 +357,7 @@ class PerfTest(unittest.TestCase):
       {"name": "DeltaBlue", "results": ["10657567.0"], "stddev": ""},
     ])
     self._VerifyErrors(
-        ["Regexp \"^Richards: (.+)$\" didn't match for test Richards."])
+        ["Regexp \"^Richards: (.+)$\" didn't match for test test/Richards."])
     self._VerifyMock(path.join("out", "x64.release", "d7"), "--flag", "run.js")
 
   def testOneRunGeneric(self):
@@ -392,8 +401,8 @@ class PerfTest(unittest.TestCase):
       {"name": "DeltaBlue", "results": [], "stddev": ""},
     ])
     self._VerifyErrors([
-      "Regexp \"^Richards: (.+)$\" didn't match for test Richards.",
-      "Regexp \"^DeltaBlue: (.+)$\" didn't match for test DeltaBlue.",
+      "Regexp \"^Richards: (.+)$\" didn't match for test test/Richards.",
+      "Regexp \"^DeltaBlue: (.+)$\" didn't match for test test/DeltaBlue.",
     ])
     self._VerifyMock(
         path.join("out", "x64.release", "d7"), "--flag", "run.js", timeout=70)
@@ -448,6 +457,19 @@ class PerfTest(unittest.TestCase):
         (path.join("out-no-patch", "x64.release", "d7"), "--flag", "run.js"),
     )
 
+  def testWrongBinaryWithProf(self):
+    test_input = dict(V8_JSON)
+    self._WriteTestInput(test_input)
+    self._MockCommand(["."], ["x\nRichards: 1.234\nDeltaBlue: 10657567\ny\n"])
+    self.assertEquals(0, self._CallMain("--extra-flags=--prof"))
+    self._VerifyResults("test", "score", [
+      {"name": "Richards", "results": ["1.234"], "stddev": ""},
+      {"name": "DeltaBlue", "results": ["10657567.0"], "stddev": ""},
+    ])
+    self._VerifyErrors([])
+    self._VerifyMock(path.join("out", "x64.release", "d7"),
+                     "--flag", "--prof", "run.js")
+
   def testUnzip(self):
     def Gen():
       for i in [1, 2, 3]:
@@ -455,3 +477,71 @@ class PerfTest(unittest.TestCase):
     l, r = run_perf.Unzip(Gen())
     self.assertEquals([1, 2, 3], list(l()))
     self.assertEquals([2, 3, 4], list(r()))
+
+  #############################################################################
+  ### System tests
+
+  def _RunPerf(self, mocked_d8, test_json):
+    output_json = path.join(TEST_WORKSPACE, "output.json")
+    args = [
+      sys.executable, RUN_PERF,
+      "--binary-override-path", os.path.join(TEST_DATA, mocked_d8),
+      "--json-test-results", output_json,
+      os.path.join(TEST_DATA, test_json),
+    ]
+    subprocess.check_output(args)
+    return self._LoadResults(output_json)
+
+  def testNormal(self):
+    results = self._RunPerf("d8_mocked1.py", "test1.json")
+    self.assertEquals([], results['errors'])
+    self.assertEquals([
+      {
+        'units': 'score',
+        'graphs': ['test1', 'Richards'],
+        'results': [u'1.2', u'1.2'],
+        'stddev': '',
+      },
+      {
+        'units': 'score',
+        'graphs': ['test1', 'DeltaBlue'],
+        'results': [u'2.1', u'2.1'],
+        'stddev': '',
+      },
+    ], results['traces'])
+
+  def testResultsProcessor(self):
+    results = self._RunPerf("d8_mocked2.py", "test2.json")
+    self.assertEquals([], results['errors'])
+    self.assertEquals([
+      {
+        'units': 'score',
+        'graphs': ['test2', 'Richards'],
+        'results': [u'1.2', u'1.2'],
+        'stddev': '',
+      },
+      {
+        'units': 'score',
+        'graphs': ['test2', 'DeltaBlue'],
+        'results': [u'2.1', u'2.1'],
+        'stddev': '',
+      },
+    ], results['traces'])
+
+  def testResultsProcessorNested(self):
+    results = self._RunPerf("d8_mocked2.py", "test3.json")
+    self.assertEquals([], results['errors'])
+    self.assertEquals([
+      {
+        'units': 'score',
+        'graphs': ['test3', 'Octane', 'Richards'],
+        'results': [u'1.2'],
+        'stddev': '',
+      },
+      {
+        'units': 'score',
+        'graphs': ['test3', 'Octane', 'DeltaBlue'],
+        'results': [u'2.1'],
+        'stddev': '',
+      },
+    ], results['traces'])

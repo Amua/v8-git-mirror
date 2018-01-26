@@ -207,7 +207,7 @@ var testCasesPDT = [
 
 // Local time cases.
 var testCasesLocalTime = [
-    // Allow timezone ommision.
+    // Allow timezone omission.
     'Sat, 01-Jan-2000 08:00:00',
     'Sat, 01 Jan 2000 08:00:00',
     'Jan 01 2000 08:00:00',
@@ -261,6 +261,31 @@ var testCasesES5MiscNegative = [
     '2000-01-01T24:00:00.001',
     '2000-01-01T24:00:00.999Z'];
 
+// TODO(littledan): This is an hack that could break in historically
+// changing timezones that happened on this day, but allows us to
+// check the date value for local times.
+var localOffset = new Date('2000-01-01').getTimezoneOffset()*1000*60;
+
+// Sanity check which is even more of a hack: in the timezones where
+// these tests are likely to be run, the offset is nonzero because
+// dates which don't include Z are in the local timezone.
+if (this.Intl &&
+    ["America/Los_Angeles", "Europe/Berlin", "Europe/Madrid"].indexOf(
+        Intl.DateTimeFormat().resolvedOptions().timeZone) != -1) {
+  assertTrue(localOffset != 0);
+}
+
+var testCasesES2016TZ = [
+    // If the timezone is absent and time is present, use local time
+    ['2000-01-02T00:00', 946771200000 + localOffset],
+    ['2000-01-02T00:00:00', 946771200000 + localOffset],
+    ['2000-01-02T00:00:00.000', 946771200000 + localOffset],
+    // If timezone is absent and time is absent, use UTC
+    ['2000-01-02', 946771200000],
+    ['2000-01-02', 946771200000],
+    ['2000-01-02', 946771200000],
+];
+
 
 // Run all the tests.
 testCasesUT.forEach(testDateParse);
@@ -282,6 +307,7 @@ testCasesES5MiscNegative.forEach(function (s) {
     assertTrue(isNaN(Date.parse(s)), s + " is not NaN.");
 });
 
+testCasesES2016TZ.forEach(testDateParseMisc);
 
 // Test that we can parse our own date format.
 // (Dates from 1970 to ~2070 with 150h steps.)

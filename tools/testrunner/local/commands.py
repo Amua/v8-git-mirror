@@ -26,6 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+import os
 import subprocess
 import sys
 from threading import Timer
@@ -49,7 +50,7 @@ def Win32SetErrorMode(mode):
   return prev_error_mode
 
 
-def RunProcess(verbose, timeout, args, **rest):
+def RunProcess(verbose, timeout, args, additional_env, **rest):
   if verbose: print "#", " ".join(args)
   popen_args = args
   prev_error_mode = SEM_INVALID_VALUE
@@ -61,12 +62,27 @@ def RunProcess(verbose, timeout, args, **rest):
     error_mode = SEM_NOGPFAULTERRORBOX
     prev_error_mode = Win32SetErrorMode(error_mode)
     Win32SetErrorMode(error_mode | prev_error_mode)
-  process = subprocess.Popen(
-    args=popen_args,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    **rest
-  )
+
+  env = os.environ.copy()
+  env.update(additional_env)
+  # GTest shard information is read by the V8 tests runner. Make sure it
+  # doesn't leak into the execution of gtests we're wrapping. Those might
+  # otherwise apply a second level of sharding and as a result skip tests.
+  env.pop('GTEST_TOTAL_SHARDS', None)
+  env.pop('GTEST_SHARD_INDEX', None)
+
+  try:
+    process = subprocess.Popen(
+      args=popen_args,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      env=env,
+      **rest
+    )
+  except Exception as e:
+    sys.stderr.write("Error executing: %s\n" % popen_args)
+    raise e
+
   if (utils.IsWindows() and prev_error_mode != SEM_INVALID_VALUE):
     Win32SetErrorMode(prev_error_mode)
 
@@ -101,14 +117,16 @@ def RunProcess(verbose, timeout, args, **rest):
   timer.start()
   stdout, stderr = process.communicate()
   timer.cancel()
-  return process.returncode, timeout_result[0], stdout, stderr
 
-
-def Execute(args, verbose=False, timeout=None):
-  args = [ c for c in args if c != "" ]
-  exit_code, timed_out, stdout, stderr = RunProcess(
-    verbose,
-    timeout,
-    args=args,
+  return output.Output(
+      process.returncode,
+      timeout_result[0],
+      stdout.decode('utf-8', 'replace').encode('utf-8'),
+      stderr.decode('utf-8', 'replace').encode('utf-8'),
+      process.pid,
   )
-  return output.Output(exit_code, timed_out, stdout, stderr)
+
+
+def Execute(args, verbose=False, timeout=None, env=None):
+  args = [ c for c in args if c != "" ]
+  return RunProcess(verbose, timeout, args, env or {})

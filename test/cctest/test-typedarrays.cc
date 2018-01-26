@@ -9,14 +9,17 @@
 
 #include "src/api.h"
 #include "src/heap/heap.h"
+#include "src/objects-inl.h"
 #include "src/objects.h"
-#include "src/v8.h"
 
-using namespace v8::internal;
+namespace v8 {
+namespace internal {
 
 void TestArrayBufferViewContents(LocalContext& env, bool should_use_buffer) {
-  v8::Local<v8::Object> obj_a =
-      v8::Local<v8::Object>::Cast(env->Global()->Get(v8_str("a")));
+  v8::Local<v8::Object> obj_a = v8::Local<v8::Object>::Cast(
+      env->Global()
+          ->Get(v8::Isolate::GetCurrent()->GetCurrentContext(), v8_str("a"))
+          .ToLocalChecked());
   CHECK(obj_a->IsArrayBufferView());
   v8::Local<v8::ArrayBufferView> array_buffer_view =
       v8::Local<v8::ArrayBufferView>::Cast(obj_a);
@@ -81,3 +84,6 @@ TEST(AllocateNotExternal) {
   CHECK(!buffer->IsExternal());
   CHECK_EQ(memory, buffer->GetContents().Data());
 }
+
+}  // namespace internal
+}  // namespace v8

@@ -6,23 +6,7 @@
 #define V8_V8_H_
 
 #include "include/v8.h"
-#include "src/allocation.h"
-
-#if defined(GOOGLE3) || defined(DCHECK_ALWAYS_ON)
-// Google3 and Chromium special flag handling.
-#if defined(DEBUG) && defined(NDEBUG)
-// V8 only uses DEBUG and whenever it is set we are building a debug
-// version of V8. We do not use NDEBUG and simply undef it here for
-// consistency.
-#undef NDEBUG
-#endif
-#endif  // defined(GOOGLE3)
-
-// V8 only uses DEBUG, but included external files
-// may use NDEBUG - make sure they are consistent.
-#if defined(DEBUG) && defined(NDEBUG)
-#error both DEBUG and NDEBUG are set
-#endif
+#include "src/globals.h"
 
 namespace v8 {
 namespace internal {
@@ -37,11 +21,14 @@ class V8 : public AllStatic {
   // Report process out of memory. Implementation found in api.cc.
   // This function will not return, but will terminate the execution.
   static void FatalProcessOutOfMemory(const char* location,
-                                      bool take_snapshot = false);
+                                      bool is_heap_oom = false);
 
   static void InitializePlatform(v8::Platform* platform);
   static void ShutdownPlatform();
-  static v8::Platform* GetCurrentPlatform();
+  V8_EXPORT_PRIVATE static v8::Platform* GetCurrentPlatform();
+  // Replaces the current platform with the given platform.
+  // Should be used only for testing.
+  static void SetPlatformForTesting(v8::Platform* platform);
 
   static void SetNativesBlob(StartupData* natives_blob);
   static void SetSnapshotBlob(StartupData* snapshot_blob);
@@ -54,6 +41,7 @@ class V8 : public AllStatic {
   static v8::Platform* platform_;
 };
 
-} }  // namespace v8::internal
+}  // namespace internal
+}  // namespace v8
 
 #endif  // V8_V8_H_
